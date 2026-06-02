@@ -1,0 +1,89 @@
+stages:
+  - test
+  - build
+  - deploy
+
+variables:
+  GOOGLE_PROJECT_ID: "devops-test"
+  GOOGLE_REGION: "us-central1"
+  GCLOUD_VERSION: "569.0.0"
+  SERVICE_NAME: "basic-service"
+  SERVICE_ACCOUNT_EMAIL: "devops-test@devops-test.iam.gserviceaccount.com"
+  UV_VERSION: "0.11.18"
+  UV_CACHE_DIR: .uv-cache
+  UV_IMAGE_TAG: "trixie-slim"
+  PYTHON_VERSION: "3.12"
+  DOCKER_VERSION: "29.5.2"
+
+.gcp_credentials:
+  before_script:
+    - printf "%s" "$GCP_SERVICE_ACCOUNT" | tee google-credentials.json >/dev/null
+    - export GOOGLE_APPLICATION_CREDENTIALS=google-credentials.json
+
+.gcp_gcloud_auth:
+  before_script:
+    - !reference [.gcp_credentials, before_script]
+    - gcloud auth activate-service-account --key-file=google-credentials.json
+    - gcloud config set project $GOOGLE_PROJECT_ID
+
+.gcr_docker_login:
+  before_script:
+    - !reference [.gcp_credentials, before_script]
+    - cat google-credentials.json | docker login -u _json_key --password-stdin https://gcr.io
+
+TestBranch:
+  stage: test
+  image: ghcr.io/astral-sh/uv:${UV_VERSION}-python${PYTHON_VERSION}-${UV_IMAGE_TAG}
+  cache:
+    key:
+      files:
+        - uv.lock
+    paths:
+      - $UV_CACHE_DIR
+      - .pytest_cache/
+    policy: pull-push
+  script:
+    - echo "Testing Branch..."
+    - uv lock --check
+    - uv sync --frozen
+    - uv run --no-sync -- pytest
+    - uv cache prune --ci
+
+BuildDockerImageBranch:
+  stage: build
+  image: docker:${DOCKER_VERSION}
+  retry: 2
+  services:
+    - name: docker:${DOCKER_VERSION}-dind
+      alias: docker
+      command: ["--tls=false"]
+      variables:
+        HEALTHCHECK_TCP_PORT: "2375"
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_HOST: tcp://docker:2375
+  before_script:
+    - !reference [.gcr_docker_login, before_script]
+    - docker info
+  only:
+    - main
+  script:
+    - echo "Building Docker Image for Branch $CI_COMMIT_SHORT_SHA..."
+    - docker build --platform linux/amd64 -t gcr.io/$GOOGLE_PROJECT_ID/$SERVICE_NAME:$CI_COMMIT_SHORT_SHA .
+    - docker push gcr.io/$GOOGLE_PROJECT_ID/$SERVICE_NAME:$CI_COMMIT_SHORT_SHA
+
+DeployDockerImageBranch:
+  stage: deploy
+  image: gcr.io/google.com/cloudsdktool/google-cloud-cli:${GCLOUD_VERSION}-stable
+  extends: .gcp_gcloud_auth
+  retry: 2
+  only:
+    - main
+  script:
+    - echo "Deploying Docker Image for Branch $CI_COMMIT_SHORT_SHA..."
+    - |
+      gcloud run deploy $SERVICE_NAME \
+        --image=gcr.io/$GOOGLE_PROJECT_ID/$SERVICE_NAME:$CI_COMMIT_SHORT_SHA \
+        --region=$GOOGLE_REGION \
+        --service-account=$SERVICE_ACCOUNT_EMAIL
+    

@@ -52,7 +52,6 @@ TestBranch:
 BuildDockerImageBranch:
   stage: build
   image: docker:${DOCKER_VERSION}
-  retry: 2
   services:
     - name: docker:${DOCKER_VERSION}-dind
       alias: docker
